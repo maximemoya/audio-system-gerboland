@@ -1,5 +1,5 @@
 import './App.css'
-import { AmbientDashboard } from './audioSystem/ambient-dashboard'
+import { AmbientDashboard } from './components/audioSystem/ambient-dashboard'
 
 function App() {
   return (
