@@ -33,7 +33,7 @@ export type PlayCreatureCryOptions = {
 const SETTINGS_STORAGE_KEY = 'geobiloand.sfx.settings';
 const DEFAULT_SETTINGS: PersistedSfxSettings = {
   muted: false,
-  volume: 0.85,
+  volume: 0.425,
   tone: 'soft'
 };
 
@@ -229,7 +229,8 @@ class SoundEngine {
     const outputNode = this.ensureOutputNode(ctx);
     const toneScale = this.settings.tone === 'soft' ? 0.86 : 1;
     const frequencyJitter = 1 + (Math.random() * 0.04 - 0.02);
-    const dynamicGain = gainAmount * (0.96 + Math.random() * 0.08);
+    const softGainScale = this.settings.tone === 'soft' ? 0.5 : 1;
+    const dynamicGain = gainAmount * softGainScale * (0.96 + Math.random() * 0.08);
 
     const envelope = ctx.createGain();
     envelope.gain.setValueAtTime(0.0001, startTime);

@@ -6,7 +6,8 @@ import {
   normalizeTerrainKey,
   pickRandom,
   rotatePattern,
-  stepDurationFromBpm
+  stepDurationFromBpm,
+  type TerrainAudioKey
 } from './ambient-math';
 import {
   getHumanRhythmPattern,
@@ -14,10 +15,12 @@ import {
   type HumanRhythmPattern
 } from './ambient-human-rhythms';
 import {
+  type AmbientDensityRange,
   resolveAmbientPreset,
   type AmbientGeneratorVariant,
   type AmbientHumanRhythmId,
   type AmbientIntensity,
+  type AmbientLayerId,
   type AmbientLayerFamily,
   type AmbientLayerPreset,
   type AmbientMirrorMode,
@@ -25,10 +28,22 @@ import {
   type AmbientPreset,
   type AmbientVoice
 } from './ambient-presets';
+import {
+  selectAmbientTheme,
+  type AmbientTheme
+} from './ambient-themes';
 
-type PersistedAmbientSettings = {
+export type PersistedAmbientSettings = {
   enabled: boolean;
   volume: number;
+};
+
+export type AmbientDebugState = {
+  settings: PersistedAmbientSettings;
+  terrain: TerrainAudioKey | null;
+  intensity: AmbientIntensity | null;
+  themeId: string | null;
+  isRunning: boolean;
 };
 
 type LayerVariantOffsets = {
@@ -83,14 +98,16 @@ type BassRiffState = {
 };
 
 type PendingEnvironmentTransition = {
-  sourceTerrainKey: string;
+  sourceTerrainKey: TerrainAudioKey;
   sourceIntensity: AmbientIntensity;
   sourcePreset: AmbientPreset;
   sourceRandom: () => number;
+  sourceTheme: AmbientTheme | null;
   sourceBpmDriftPhaseOffset: number;
-  terrainKey: string;
+  terrainKey: TerrainAudioKey;
   intensity: AmbientIntensity;
   targetPreset: AmbientPreset;
+  targetTheme: AmbientTheme | null;
   startLayers: AmbientLayerPreset[];
   targetLayers: AmbientLayerPreset[];
   startHumanRhythmIds: AmbientHumanRhythmId[];
@@ -337,9 +354,11 @@ class AmbientEngine {
   private readonly supportsAudio: boolean;
   private settings: PersistedAmbientSettings;
   private preset: AmbientPreset | null = null;
-  private terrainKey = 'normal';
+  private currentTheme: AmbientTheme | null = null;
+  private terrainKey: TerrainAudioKey = 'normal';
   private intensity: AmbientIntensity = 'explore';
   private random = createSeededRandom('ambient-default');
+  private environmentSerial = 0;
   private nextStepTime = 0;
   private stepIndex = 0;
   private melodyDegree = 0;
@@ -379,6 +398,16 @@ class AmbientEngine {
     return { ...this.settings };
   }
 
+  getDebugState(): AmbientDebugState {
+    return {
+      settings: this.getSettings(),
+      terrain: this.preset ? this.terrainKey : null,
+      intensity: this.preset ? this.intensity : null,
+      themeId: this.currentTheme?.id ?? null,
+      isRunning: this.schedulerId !== null
+    };
+  }
+
   setEnabled(enabled: boolean): void {
     this.settings = { ...this.settings, enabled };
     this.persistSettings();
@@ -410,6 +439,7 @@ class AmbientEngine {
 
   async start(terrain?: string | null, intensity: AmbientIntensity = 'explore'): Promise<void> {
     const nextTerrainKey = normalizeTerrainKey(terrain);
+    const environmentSeed = `${nextTerrainKey}:${intensity}:${this.environmentSerial + 1}`;
 
     if (!this.supportsAudio || !this.settings.enabled) return;
 
@@ -425,11 +455,13 @@ class AmbientEngine {
         return;
       }
 
-      this.beginEnvironmentTransition(nextTerrainKey, intensity);
+      this.environmentSerial += 1;
+      this.beginEnvironmentTransition(nextTerrainKey, intensity, environmentSeed);
       return;
     }
 
-    this.configureEnvironmentState(nextTerrainKey, intensity);
+    this.environmentSerial += 1;
+    this.configureEnvironmentState(nextTerrainKey, intensity, environmentSeed);
     if (!this.preset) return;
 
     this.masterGain.gain.cancelScheduledValues(this.context.currentTime);
@@ -460,7 +492,9 @@ class AmbientEngine {
       this.schedulerId = null;
     }
 
-    this.pendingEnvironmentTransition = null;
+    if (this.pendingEnvironmentTransition) {
+      this.cancelEnvironmentTransition();
+    }
   }
 
   async resume(): Promise<void> {
@@ -536,7 +570,7 @@ class AmbientEngine {
       this.tapeEchoFeedbackLowpass.type = 'lowpass';
       this.tapeEchoFeedbackLowpass.frequency.value = 1480;
       this.tapeEchoFeedbackDrive = this.context.createWaveShaper();
-      this.tapeEchoFeedbackDrive.curve = this.createTapeEchoSaturationCurve(1.15) as unknown as Float32Array<ArrayBuffer>;
+      this.tapeEchoFeedbackDrive.curve = this.createTapeEchoSaturationCurve(1.15);
       this.tapeEchoFeedbackDrive.oversample = '2x';
       this.tapeEchoFeedbackGain = this.context.createGain();
       this.tapeEchoFeedbackGain.gain.value = TAPE_ECHO_ENABLED ? TAPE_ECHO_BASE_FEEDBACK.explore : 0;
@@ -604,7 +638,11 @@ class AmbientEngine {
     window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(this.settings));
   }
 
-  private configureEnvironmentState(terrainKey: string, intensity: AmbientIntensity): void {
+  private configureEnvironmentState(
+    terrainKey: TerrainAudioKey,
+    intensity: AmbientIntensity,
+    environmentSeed = `${terrainKey}:${intensity}:${this.environmentSerial}`
+  ): void {
     if (!this.context) return;
 
     this.terrainKey = terrainKey;
@@ -612,7 +650,12 @@ class AmbientEngine {
     this.preset = resolveAmbientPreset(this.terrainKey);
     if (!this.preset) return;
 
-    this.random = createSeededRandom(`${this.sessionSeed}:${this.terrainKey}:${this.intensity}`);
+    this.currentTheme = selectAmbientTheme(
+      this.terrainKey,
+      this.intensity,
+      createSeededRandom(`${this.sessionSeed}:${environmentSeed}:theme`)
+    );
+    this.random = createSeededRandom(`${this.sessionSeed}:${environmentSeed}:arrangement`);
     this.stepIndex = 0;
     this.nextStepTime = this.context.currentTime + 0.05;
     this.melodyDegree = Math.floor(this.random() * this.preset.scaleIntervals.length);
@@ -636,13 +679,20 @@ class AmbientEngine {
   }
 
   private previewEnvironmentSelection(
-    terrainKey: string,
-    intensity: AmbientIntensity
-  ): { preset: AmbientPreset; activeLayers: AmbientLayerPreset[]; activeHumanRhythmIds: AmbientHumanRhythmId[] } {
+    terrainKey: TerrainAudioKey,
+    intensity: AmbientIntensity,
+    environmentSeed: string
+  ): {
+    preset: AmbientPreset;
+    theme: AmbientTheme | null;
+    activeLayers: AmbientLayerPreset[];
+    activeHumanRhythmIds: AmbientHumanRhythmId[];
+  } {
     const previousPreset = this.preset;
     const previousTerrainKey = this.terrainKey;
     const previousIntensity = this.intensity;
     const previousRandom = this.random;
+    const previousTheme = this.currentTheme;
     const previousActiveLayers = this.activeLayers;
     const previousActiveHumanRhythmIds = this.activeHumanRhythmIds;
 
@@ -650,10 +700,16 @@ class AmbientEngine {
     this.preset = previewPreset;
     this.terrainKey = terrainKey;
     this.intensity = intensity;
-    this.random = createSeededRandom(`${this.sessionSeed}:${terrainKey}:${intensity}:transition-preview`);
+    this.currentTheme = selectAmbientTheme(
+      terrainKey,
+      intensity,
+      createSeededRandom(`${this.sessionSeed}:${environmentSeed}:theme`)
+    );
+    this.random = createSeededRandom(`${this.sessionSeed}:${environmentSeed}:transition-preview`);
     this.activeLayers = this.selectActiveLayers([]);
     this.activeHumanRhythmIds = this.selectActiveHumanRhythms([]);
 
+    const previewTheme = this.currentTheme;
     const previewLayers = [...this.activeLayers];
     const previewHumanRhythmIds = [...this.activeHumanRhythmIds];
 
@@ -661,33 +717,41 @@ class AmbientEngine {
     this.terrainKey = previousTerrainKey;
     this.intensity = previousIntensity;
     this.random = previousRandom;
+    this.currentTheme = previousTheme;
     this.activeLayers = previousActiveLayers;
     this.activeHumanRhythmIds = previousActiveHumanRhythmIds;
 
     return {
       preset: previewPreset,
+      theme: previewTheme,
       activeLayers: previewLayers,
       activeHumanRhythmIds: previewHumanRhythmIds
     };
   }
 
-  private beginEnvironmentTransition(terrainKey: string, intensity: AmbientIntensity): void {
+  private beginEnvironmentTransition(
+    terrainKey: TerrainAudioKey,
+    intensity: AmbientIntensity,
+    environmentSeed: string
+  ): void {
     if (!this.context || !this.preset) {
-      this.configureEnvironmentState(terrainKey, intensity);
+      this.configureEnvironmentState(terrainKey, intensity, environmentSeed);
       return;
     }
 
-    const preview = this.previewEnvironmentSelection(terrainKey, intensity);
+    const preview = this.previewEnvironmentSelection(terrainKey, intensity, environmentSeed);
 
     this.pendingEnvironmentTransition = {
       sourceTerrainKey: this.terrainKey,
       sourceIntensity: this.intensity,
       sourcePreset: this.preset,
       sourceRandom: this.random,
+      sourceTheme: this.currentTheme,
       sourceBpmDriftPhaseOffset: this.bpmDriftPhaseOffset,
       terrainKey,
       intensity,
       targetPreset: preview.preset,
+      targetTheme: preview.theme,
       startLayers: [...this.activeLayers],
       targetLayers: preview.activeLayers,
       startHumanRhythmIds: [...this.activeHumanRhythmIds],
@@ -701,10 +765,27 @@ class AmbientEngine {
     this.terrainKey = terrainKey;
     this.intensity = intensity;
     this.preset = preview.preset;
-    this.random = createSeededRandom(`${this.sessionSeed}:${this.terrainKey}:${this.intensity}:transition-live`);
+    this.currentTheme = preview.theme;
+    this.random = createSeededRandom(`${this.sessionSeed}:${environmentSeed}:transition-live`);
     this.bpmDriftPhaseOffset = (this.random() - 0.5) * (Math.PI / 2);
     this.syncMusicalFxToTempo(this.stepIndex);
     this.resetFxBusFilters();
+  }
+
+  private cancelEnvironmentTransition(): void {
+    if (this.pendingEnvironmentTransition) {
+      this.terrainKey = this.pendingEnvironmentTransition.sourceTerrainKey;
+      this.intensity = this.pendingEnvironmentTransition.sourceIntensity;
+      this.preset = this.pendingEnvironmentTransition.sourcePreset;
+      this.random = this.pendingEnvironmentTransition.sourceRandom;
+      this.currentTheme = this.pendingEnvironmentTransition.sourceTheme;
+      this.bpmDriftPhaseOffset = this.pendingEnvironmentTransition.sourceBpmDriftPhaseOffset;
+      this.activeLayers = [...this.pendingEnvironmentTransition.startLayers];
+      this.activeHumanRhythmIds = [...this.pendingEnvironmentTransition.startHumanRhythmIds];
+      this.syncMusicalFxToTempo(this.stepIndex);
+      this.resetFxBusFilters();
+    }
+    this.pendingEnvironmentTransition = null;
   }
 
   private maybeAdvanceEnvironmentTransition(stepIndex: number): void {
@@ -774,23 +855,101 @@ class AmbientEngine {
     this.pendingRhythmTransition = null;
   }
 
+  private getThemeTimbreVariationBars(): number {
+    return Math.max(4, this.currentTheme?.timbreVariationBars ?? 4);
+  }
+
+  private getThemeMelodyVariationBars(): number {
+    return Math.max(8, this.currentTheme?.melodyVariationBars ?? MELODY_VARIATION_BARS[this.intensity]);
+  }
+
+  private getThemeRhythmVariationBars(): number {
+    return Math.max(4, this.currentTheme?.rhythmVariationBars ?? RHYTHM_VARIATION_BARS[this.intensity]);
+  }
+
+  private getThemeRhythmRotationBars(): number {
+    return Math.max(4, this.currentTheme?.rhythmRotationBars ?? RHYTHM_ROTATION_BARS[this.intensity]);
+  }
+
+  private resolveActiveDensity(): AmbientDensityRange {
+    if (!this.preset) {
+      return { min: 0, max: 0 };
+    }
+
+    return this.currentTheme?.density ?? this.preset.density[this.intensity];
+  }
+
+  private resolveActiveAnchorLayerIds(): AmbientLayerId[] {
+    return this.currentTheme?.anchorLayers?.length
+      ? this.currentTheme.anchorLayers
+      : ANCHOR_LAYER_IDS[this.intensity];
+  }
+
+  private resolveActiveFamilyCaps(): Record<AmbientLayerFamily, number> {
+    const baseCaps = FAMILY_CAPS[this.intensity];
+    return {
+      rhythm: this.currentTheme?.familyCaps?.rhythm ?? baseCaps.rhythm,
+      low: this.currentTheme?.familyCaps?.low ?? baseCaps.low,
+      harmony: this.currentTheme?.familyCaps?.harmony ?? baseCaps.harmony,
+      melody: this.currentTheme?.familyCaps?.melody ?? baseCaps.melody,
+      texture: this.currentTheme?.familyCaps?.texture ?? baseCaps.texture
+    };
+  }
+
+  private isLayerEnabledForTheme(layer: AmbientLayerPreset): boolean {
+    if (!this.currentTheme) {
+      return true;
+    }
+
+    if (this.currentTheme.blockedLayers?.includes(layer.id)) {
+      return false;
+    }
+
+    if (this.currentTheme.allowedLayers?.length) {
+      return this.currentTheme.allowedLayers.includes(layer.id);
+    }
+
+    return true;
+  }
+
+  private resolveThemeLayerWeight(layer: AmbientLayerPreset): number {
+    const multiplier = this.currentTheme?.layerWeightMultipliers?.[layer.id] ?? 1;
+    return Math.max(0.05, layer.weight * multiplier);
+  }
+
+  private pickLayerVariant<T>(
+    variants: T[] | undefined,
+    lockedIndex: number | undefined,
+    index: number
+  ): T | undefined {
+    if (!variants?.length) {
+      return undefined;
+    }
+
+    const safeIndex = typeof lockedIndex === 'number'
+      ? ((lockedIndex % variants.length) + variants.length) % variants.length
+      : ((index % variants.length) + variants.length) % variants.length;
+
+    return variants[safeIndex];
+  }
+
   private advanceArrangementIfNeeded(stepIndex: number): void {
     if (!this.preset || stepIndex === 0 || stepIndex % STEPS_PER_BAR !== 0) return;
 
     this.maybeUpdateBassRiff(stepIndex);
 
-    const isTimbreBoundary = stepIndex % (STEPS_PER_BAR * 4) === 0;
+    const isTimbreBoundary = stepIndex % (STEPS_PER_BAR * this.getThemeTimbreVariationBars()) === 0;
     if (isTimbreBoundary) {
       this.variationCounter += this.random() > 0.7 ? 2 : 1;
     }
 
-    const isMelodyVariationBoundary = stepIndex % (STEPS_PER_BAR * MELODY_VARIATION_BARS[this.intensity]) === 0;
+    const isMelodyVariationBoundary = stepIndex % (STEPS_PER_BAR * this.getThemeMelodyVariationBars()) === 0;
     if (isMelodyVariationBoundary) {
       this.melodyVariationCounter += 1;
     }
 
-    const isRhythmRotationBoundary = stepIndex % (STEPS_PER_BAR * RHYTHM_ROTATION_BARS[this.intensity]) === 0;
-    const isRhythmVariationBoundary = stepIndex % (STEPS_PER_BAR * RHYTHM_VARIATION_BARS[this.intensity]) === 0;
+    const isRhythmRotationBoundary = stepIndex % (STEPS_PER_BAR * this.getThemeRhythmRotationBars()) === 0;
+    const isRhythmVariationBoundary = stepIndex % (STEPS_PER_BAR * this.getThemeRhythmVariationBars()) === 0;
     if (!this.pendingRhythmTransition && (isRhythmRotationBoundary || isRhythmVariationBoundary)) {
       const nextRotationShift = isRhythmRotationBoundary && this.random() > 0.42
         ? Math.floor(this.random() * 4)
@@ -993,13 +1152,15 @@ class AmbientEngine {
     if (!this.preset) return [];
 
     const candidates = this.preset.layers.filter((layer) => (
-      layer.intensities.includes(this.intensity) && layer.phases.includes(this.currentPhase)
+      layer.intensities.includes(this.intensity)
+      && layer.phases.includes(this.currentPhase)
+      && this.isLayerEnabledForTheme(layer)
     ));
 
     if (candidates.length === 0) return [];
 
-    const density = this.preset.density[this.intensity];
-    const anchorIds = ANCHOR_LAYER_IDS[this.intensity];
+    const density = this.resolveActiveDensity();
+    const anchorIds = this.resolveActiveAnchorLayerIds();
     const anchorCandidates = candidates.filter((layer) => anchorIds.includes(layer.id));
     const targetCount = Math.min(
       candidates.length,
@@ -1009,7 +1170,7 @@ class AmbientEngine {
       )
     );
 
-    const familyCaps = FAMILY_CAPS[this.intensity];
+    const familyCaps = this.resolveActiveFamilyCaps();
     const familyCounts: Record<AmbientLayerFamily, number> = {
       rhythm: 0,
       low: 0,
@@ -1070,7 +1231,7 @@ class AmbientEngine {
     return [...layers]
       .map((layer) => ({
         layer,
-        rank: -Math.log(Math.max(this.random(), 0.0001)) / Math.max(layer.weight, 0.05)
+        rank: -Math.log(Math.max(this.random(), 0.0001)) / this.resolveThemeLayerWeight(layer)
       }))
       .sort((left, right) => left.rank - right.rank)
       .map(({ layer }) => layer);
@@ -1120,6 +1281,7 @@ class AmbientEngine {
 
   private completeEnvironmentTransition(transition: PendingEnvironmentTransition): void {
     this.pendingEnvironmentTransition = null;
+    this.currentTheme = transition.targetTheme;
     this.activeLayers = transition.targetLayers;
     this.activeHumanRhythmIds = transition.targetHumanRhythmIds;
     this.syncMusicalFxToTempo(this.stepIndex);
@@ -1133,7 +1295,11 @@ class AmbientEngine {
     const candidateIds = Array.from(new Set(
       this.activeLayers.flatMap((layer) => layer.humanRhythmIds ?? [])
     ));
-    const candidates = candidateIds
+    const themedCandidateIds = this.currentTheme?.preferredHumanRhythms?.length
+      ? candidateIds.filter((id) => this.currentTheme?.preferredHumanRhythms?.includes(id))
+      : candidateIds;
+    const activeCandidateIds = themedCandidateIds.length > 0 ? themedCandidateIds : candidateIds;
+    const candidates = activeCandidateIds
       .map((id) => getHumanRhythmPattern(id))
       .filter((pattern) => (
         pattern.intensities.includes(this.intensity) &&
@@ -1247,21 +1413,36 @@ class AmbientEngine {
   ): ResolvedLayerRuntime {
     const offsets = this.layerVariantOffsets[layer.id] ?? { rhythm: 0, accent: 0, mirror: 0, degree: 0, filter: 0, generator: 0 };
     const layerVariationCounter = this.getLayerVariationCounter(layer);
-    const rhythmVariant = layer.rhythmVariants?.length
-      ? layer.rhythmVariants[(rhythmVariationCounterOverride + offsets.rhythm) % layer.rhythmVariants.length]
-      : undefined;
-    const accentPattern = layer.accentVariants?.length
-      ? layer.accentVariants[(rhythmVariationCounterOverride + offsets.accent) % layer.accentVariants.length]
-      : undefined;
-    const mirrorMode = layer.mirrorVariants?.length
-      ? layer.mirrorVariants[(rhythmVariationCounterOverride + offsets.mirror) % layer.mirrorVariants.length]
-      : undefined;
-    const degreePattern = layer.degreeVariants?.length
-      ? layer.degreeVariants[(layerVariationCounter + offsets.degree) % layer.degreeVariants.length]
-      : undefined;
-    const generator = layer.generatorVariants?.length
-      ? layer.generatorVariants[(layerVariationCounter + offsets.generator) % layer.generatorVariants.length]
-      : undefined;
+    const lockedRhythmIndex = this.currentTheme?.lockedRhythmVariants?.[layer.id];
+    const lockedAccentIndex = this.currentTheme?.lockedAccentVariants?.[layer.id];
+    const lockedMirrorIndex = this.currentTheme?.lockedMirrorVariants?.[layer.id];
+    const lockedDegreeIndex = this.currentTheme?.lockedDegreeVariants?.[layer.id];
+    const lockedGeneratorIndex = this.currentTheme?.lockedGeneratorVariants?.[layer.id];
+    const rhythmVariant = this.pickLayerVariant(
+      layer.rhythmVariants,
+      lockedRhythmIndex,
+      rhythmVariationCounterOverride + offsets.rhythm
+    );
+    const accentPattern = this.pickLayerVariant(
+      layer.accentVariants,
+      lockedAccentIndex,
+      rhythmVariationCounterOverride + offsets.accent
+    );
+    const mirrorMode = this.pickLayerVariant(
+      layer.mirrorVariants,
+      lockedMirrorIndex,
+      rhythmVariationCounterOverride + offsets.mirror
+    );
+    const degreePattern = this.pickLayerVariant(
+      layer.degreeVariants,
+      lockedDegreeIndex,
+      layerVariationCounter + offsets.degree
+    );
+    const generator = this.pickLayerVariant(
+      layer.generatorVariants,
+      lockedGeneratorIndex,
+      layerVariationCounter + offsets.generator
+    );
     const humanRhythm = this.resolveActiveHumanRhythmLane(layer);
 
     const baseFilterHz = rhythmVariant?.filterHz ?? layer.filterHz;
@@ -2072,7 +2253,7 @@ class AmbientEngine {
     if (!this.preset) return 80;
 
     const baseBpm = this.preset.bpm[this.intensity];
-    const amplitude = BPM_SWING_MAX * BPM_SWING_SCALE[this.intensity];
+    const amplitude = BPM_SWING_MAX * BPM_SWING_SCALE[this.intensity] * (this.currentTheme?.bpmSwingScale ?? 1);
     if (amplitude <= 0.01) {
       return baseBpm;
     }
@@ -2353,9 +2534,9 @@ class AmbientEngine {
     return buffer;
   }
 
-  private createTapeEchoSaturationCurve(amount: number): Float32Array {
+  private createTapeEchoSaturationCurve(amount: number): Float32Array<ArrayBuffer> {
     const samples = 1024;
-    const curve = new Float32Array(samples);
+    const curve = new Float32Array(new ArrayBuffer(samples * Float32Array.BYTES_PER_ELEMENT));
     const drive = Math.max(0.5, amount);
 
     for (let index = 0; index < samples; index += 1) {
@@ -2398,4 +2579,8 @@ export const setAmbientEnabled = (enabled: boolean): void => {
 
 export const setAmbientVolume = (volume: number): void => {
   getEngine().setVolume(volume);
+};
+
+export const getAmbientDebugState = (): AmbientDebugState => {
+  return getEngine().getDebugState();
 };

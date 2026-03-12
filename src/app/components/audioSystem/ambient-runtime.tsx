@@ -1,39 +1,23 @@
 import React, { useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
+import { useSelector } from 'react-redux';
+import type { RootState } from '../store/store';
 import { startAmbient, stopAmbient } from './ambient-engine';
-import type { AmbientIntensity } from './ambient-presets';
-
-const resolveAmbientContext = (pathname: string): { terrain: string; intensity: AmbientIntensity } => {
-  if (pathname === '/auth') return { terrain: 'fee', intensity: 'idle' };
-  if (pathname === '/dashboard') return { terrain: 'normal', intensity: 'hub' };
-  if (pathname.startsWith('/battle')) return { terrain: 'combat', intensity: 'battle' };
-  if (pathname.startsWith('/zones')) return { terrain: 'plante', intensity: 'explore' };
-  if (pathname.startsWith('/capture-zones')) return { terrain: 'normal', intensity: 'explore' };
-  if (pathname.startsWith('/certifications')) return { terrain: 'acier', intensity: 'hub' };
-  if (pathname.startsWith('/shop')) return { terrain: 'fee', intensity: 'hub' };
-  if (pathname.startsWith('/arcade')) return { terrain: 'electrique', intensity: 'hub' };
-
-  if (
-    pathname.startsWith('/collection')
-    || pathname.startsWith('/profile')
-    || pathname.startsWith('/tickets')
-    || pathname.startsWith('/manage-team')
-    || pathname.startsWith('/learnset')
-    || pathname.startsWith('/starter-selection')
-  ) {
-    return { terrain: 'psy', intensity: 'hub' };
-  }
-
-  return { terrain: 'normal', intensity: 'idle' };
-};
+import { resolveAmbientContext } from './ambient-context';
 
 export const RouteAmbientRuntime: React.FC = () => {
   const location = useLocation();
+  const battleTerrain = useSelector((state: RootState) => (
+    state.battle.visualBattle?.terrain ?? state.battle.battle?.terrain ?? null
+  ));
 
   useEffect(() => {
-    const { terrain, intensity } = resolveAmbientContext(location.pathname);
+    const { terrain, intensity } = resolveAmbientContext({
+      pathname: location.pathname,
+      battleTerrain
+    });
     void startAmbient(terrain, intensity);
-  }, [location.pathname]);
+  }, [location.pathname, battleTerrain]);
 
   useEffect(() => {
     return () => {

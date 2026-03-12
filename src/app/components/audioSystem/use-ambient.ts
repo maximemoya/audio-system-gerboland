@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import {
+  getAmbientDebugState,
   getAmbientSettings,
   resumeAmbient,
   setAmbientEnabled,
@@ -15,6 +16,7 @@ export const useAmbient = () => {
     stop: (fadeOutMs?: number) => stopAmbient(fadeOutMs),
     resume: () => resumeAmbient(),
     getSettings: () => getAmbientSettings(),
+    getDebugState: () => getAmbientDebugState(),
     setEnabled: (enabled: boolean) => setAmbientEnabled(enabled),
     setVolume: (volume: number) => setAmbientVolume(volume)
   }), []);
