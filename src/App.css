@@ -1,0 +1,5 @@
+#root,
+.app-shell,
+.app-dashboard {
+  min-height: 100vh;
+}
